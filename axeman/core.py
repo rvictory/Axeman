@@ -15,6 +15,11 @@ import aiohttp
 import aioprocessing
 import logging
 import locale
+import boto3
+import json
+
+firehose_client = None
+firehose_name = None
 
 try:
     locale.setlocale(locale.LC_ALL, 'en_US')
@@ -164,6 +169,9 @@ async def processing_coro(download_results_queue, output_dir="/tmp"):
     await process_pool.coro_join()
 
 def process_worker(result_info):
+    global firehose_client
+    global firehose_name
+
     logging.debug("Worker {} starting...".format(os.getpid()))
     if not result_info:
         return
@@ -208,24 +216,41 @@ def process_worker(result_info):
 
             chain_hash = hashlib.sha256("".join([x['as_der'] for x in cert_data['chain']]).encode('ascii')).hexdigest()
 
-            # header = "url, cert_index, chain_hash, cert_der, all_domains, not_before, not_after"
-            lines.append(
-                ",".join([
-                    result_info['log_info']['url'],
-                    str(entry['cert_index']),
-                    chain_hash,
-                    cert_data['leaf_cert']['as_der'],
-                    ' '.join(cert_data['leaf_cert']['all_domains']),
-                    str(cert_data['leaf_cert']['not_before']),
-                    str(cert_data['leaf_cert']['not_after'])
-                ]) + "\n"
+            if firehose_client:
+                lines.append({'log_url': result_info['log_info']['url'],
+                              'cert_index': (entry['cert_index']),
+                              'chain_hash': chain_hash,
+                              'domains': ' '.join(cert_data['leaf_cert']['all_domains']),
+                              'not_before': (cert_data['leaf_cert']['not_before']),
+                              'not_after': (cert_data['leaf_cert']['not_after']),
+                              'timestamp': mtl.Timestamp,
+                              'subject': cert_data['leaf_cert']['subject']['aggregated'],
+                              'extensions': cert_data['leaf_cert']['extensions']})
+            else:
+                # header = "url, cert_index, chain_hash, cert_der, all_domains, not_before, not_after"
+                lines.append(
+                    ",".join([
+                        result_info['log_info']['url'],
+                        str(entry['cert_index']),
+                        chain_hash,
+                        cert_data['leaf_cert']['as_der'],
+                        ' '.join(cert_data['leaf_cert']['all_domains']),
+                        str(cert_data['leaf_cert']['not_before']),
+                        str(cert_data['leaf_cert']['not_after'])
+                    ]) + "\n"
+                )
+
+        print("[{}] Finished, writing {} lines to output...".format(os.getpid(), len(lines)))
+
+        if firehose_client:
+            response = firehose_client.put_record_batch(
+               DeliveryStreamName=firehose_name,
+               Records=[{'Data':str.encode(json.dumps(x))} for x in lines]
             )
-
-        print("[{}] Finished, writing CSV...".format(os.getpid()))
-
-        with open(csv_file, 'w', encoding='utf8') as f:
-            f.write("".join(lines))
-        print("[{}] CSV {} written!".format(os.getpid(), csv_file))
+        else:
+            with open(csv_file, 'w', encoding='utf8') as f:
+                f.write("".join(lines))
+            print("[{}] CSV {} written!".format(os.getpid(), csv_file))
 
     except Exception as e:
         print("========= EXCEPTION =========")
@@ -274,6 +299,10 @@ def main():
 
     parser.add_argument('-c', dest='concurrency_count', action='store', default=50, type=int, help="The number of concurrent downloads to run at a time")
 
+    parser.add_argument('-firehose', dest="use_firehose", action="store_true", help="Output to AWS Firehose")
+
+    parser.add_argument('-firehose_name', dest="firehose_name_arg", action="store", help="The name of the Firehose Stream to write to")
+
     args = parser.parse_args()
 
     if args.list_mode:
@@ -282,12 +311,22 @@ def main():
 
     handlers = [logging.FileHandler(args.log_file), logging.StreamHandler()]
 
+    global firehose_client
+    global firehose_name
+    firehose_name = args.firehose_name_arg
+
     if args.verbose:
         logging.basicConfig(format='[%(levelname)s:%(name)s] %(asctime)s - %(message)s', level=logging.DEBUG, handlers=handlers)
     else:
         logging.basicConfig(format='[%(levelname)s:%(name)s] %(asctime)s - %(message)s', level=logging.INFO, handlers=handlers)
 
     logging.info("Starting...")
+
+    if args.use_firehose:
+        firehose_client = boto3.client('firehose')
+        logging.info("Using Firehose to log to {}".format(firehose_name))
+    else:
+        firehose_client = None
 
     if args.ctl_url:
         loop.run_until_complete(retrieve_certificates(loop, url=args.ctl_url, ctl_offset=int(args.ctl_offset), concurrency_count=args.concurrency_count, output_directory=args.output_dir))
