@@ -293,6 +293,8 @@ def main():
 
     parser.add_argument('-z', dest="ctl_offset", action="store", default=0, help="The CTL offset to start at")
 
+    parser.add_argument('-e', dest="ctl_end", action="store", default=-1, help="The CTL offset to stop at")
+
     parser.add_argument('-o', dest="output_dir", action="store", default="/tmp", help="The output directory to store certificates in")
 
     parser.add_argument('-v', dest="verbose", action="store_true", help="Print out verbose/debug info")
